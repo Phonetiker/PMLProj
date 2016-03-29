@@ -1,0 +1,241 @@
+---
+title: "PML: Weightlifting Movement Error Prediction Assignment"
+author: "Coursera Participant"
+date: "March 24, 2016"
+output: html_document
+---
+
+# SYNOPSIS
+This document summarizes the development and selection of a machine learning model. The candidate models were trained, validated and tested on a data set consisting of human movement during weight-lifting exercises, kindly made available by Eduardo Velloso and colleagues (see [Velloso et al., 2013](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201), for further details). The dependent measure was *error type*. Participants performed unilateral dumbbell bicep curls with a 1.25 kg dumbell, in one of five ways: (A) correctly, (B) throwing elbows forward, (C) lifting only halfway, (D) lowering only halfway, (E) throwing hips forward. These error type codes are listed in  column *classe* in the data set. Movement data is provided in 152 columns, detailing various aspects of the trajectories, velocities and distributional characteristics of movements recorded by sensors on (i) the upper arm, (ii) forearm, (iii) waist, and (iv) dumbbell. Additionally, the first 6 columns of the data set provide metadata: participant identifiers and various formats of time information. The data set is available for download here: [training data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv), [test data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv). Additional information from the research group who collected it is available at the [project website](http://groupware.les.inf.puc-rio.br/har).
+
+The optimal model was created by:
+
+1. removing/ignoring variables in the training data set for which no values were available in the test data set,
+
+2. running an initial principal components analysis (PCA) of the training set and plotting it to determine how many components to use to train the model, in order to reduce the remaining variables to a smaller, maximally informative set of variables
+
+3. further subdividing the training data into training (80%) and validation (20%) chunks (see Hastie, Tibshirani & Friedman, 2008, pp. 245-247) to confirm whether the error rate for the final model in the training subdivision is accurate for an entirely new sample, 
+
+4. preprocessing the training data subdivision using PCA with the number of components (ultimately capped at 12, based on the screeplot produced in point 2 above and further model comparisons), 
+
+5. training a variety of model using a *random forest* algorithm,
+
+6. comparing the models, and
+
+7. testing accuracy on the validation set (20% of the original training data).
+
+# DATA LOADING AND PROCESSING
+
+First, we download and load the data sets if they are not available in the current workspace.
+
+```{r echo=TRUE}
+## Check if the data is there. If it isn't, download it.
+if(!(exists("pmltrain"))) {
+        ## If training data is not there, download the file from its URL 
+        ## then load the data into the workspace 
+        fileURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+        download.file(fileURL, destfile="./pml-training.csv")
+        pmltrain <- read.csv("pml-training.csv")
+}
+
+if(!(exists("pmltest"))) {
+        ## If testing data is not there, download the file from its URL 
+        ## then load the data into the workspace 
+        fileURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+        download.file(fileURL, destfile="./pml-testing.csv")
+        pmltest <- read.csv("pml-testing.csv")
+}
+
+# Remove this no longer needed variable
+rm(fileURL)
+```
+
+We must also ensure the necessary packages are loaded.
+```{r echo=TRUE}
+require("caret") 
+require("randomForest")
+require("rgl")
+```
+
+Let's set the seed and take a quick look at the variable names of the data set
+```{r echo=TRUE}
+set.seed(1131)
+names(pmltrain)[1]
+## Make the numeric factor variables numeric variables
+for (i in c(8:159)) {
+        vname <- names(pmltrain[i])
+        if(class(pmltrain[,i])=="factor") {
+                pmltrain[,i] <- as.numeric(pmltrain[,i])
+        }
+}
+```
+
+Although we would unfairly advantage our model if we took information from informative test data set variables, we should check to see whether the test data set contains data for all of the variables. If there are any that are entirely missing for all cases, we can exclude these variables from both the training and test data sets, since they will ultimately serve no useful purpose within this train-test exercise (though if we were planning to use this model on further data sets that might include these extraneous variables, we would have to reconsider ignoring them).
+``` {r echo=TRUE}
+## Remove columns that consist exclusively of NAs
+pmltestm <- pmltest[, colSums(is.na(pmltest)) != nrow(pmltest)]
+## Get the names and column numbers of the good columns with real data 
+## (the ones we want to keep)
+gnames <- names(pmltestm)
+gcols <- which(colnames(pmltrain) %in% gnames)
+
+## Get just the numeric columns of the remaining data for the initial PCA 
+## (excluding metadata: participant ID and timestamps, etc.)
+gncols <- gcols[8:length(gcols)]
+```
+
+Before we do any further processing, we must divide the training data set into training and validation subdivisions, including just the variables that appear in the test data set.
+
+``` {r echo=TRUE}
+## Create an 80/20 data split
+inTrain <- createDataPartition(y=pmltrain$classe, p=.8, list=FALSE)
+
+## Divide the data into training and validaiton sets
+pmltraint <- pmltrain[inTrain,c(gncols, 160)]
+pmltrainv <- pmltrain[-inTrain,c(gncols, 160)]
+```
+
+Next we'll run a preliminary PCA to determine how many components to include in the model we train.
+Because the PCA function only accepts numeric variables, we'll first reassign the *classe* variable to the numbers 1-5 rather than the letters A-E.
+
+``` {r echo=TRUE}
+## Create a modified data set for the preliminary PCA
+pmltraintn <- pmltraint
+pmltraintn$classf <- NA
+pmltraintn$classf[pmltraintn$classe=="A"] <- 1
+pmltraintn$classf[pmltraintn$classe=="B"] <- 2
+pmltraintn$classf[pmltraintn$classe=="C"] <- 3
+pmltraintn$classf[pmltraintn$classe=="D"] <- 4
+pmltraintn$classf[pmltraintn$classe=="E"] <- 5
+pmltraintn <- pmltraintn[,c(1:(dim(pmltraintn)[2]-2),dim(pmltraintn)[2])]
+
+## Run the PCA and produce a screeplot
+pca1 <- prcomp(pmltraintn)
+screeplot(pca1, npcs=15, type = "line")
+```
+
+The error rate decreases in the screeplot become negligible between 10-15 components, so we will compare models trained on components within this range.
+
+``` {r echo=TRUE}
+## First set up the PCA preprocessing to be applied during training
+preP10 <- preProcess(pmltraint, method="pca", pcaComp=10)
+preP11 <- preProcess(pmltraint, method="pca", pcaComp=11)
+preP12 <- preProcess(pmltraint, method="pca", pcaComp=12)
+preP13 <- preProcess(pmltraint, method="pca", pcaComp=13)
+preP14 <- preProcess(pmltraint, method="pca", pcaComp=14)
+preP15 <- preProcess(pmltraint, method="pca", pcaComp=15)
+
+## Then produce the predicted principle component values for each of these models
+trainPC10 <- predict(preP10, pmltraint)
+trainPC11 <- predict(preP11, pmltraint)
+trainPC12 <- predict(preP12, pmltraint)
+trainPC13 <- predict(preP13, pmltraint)
+trainPC14 <- predict(preP14, pmltraint)
+trainPC15 <- predict(preP15, pmltraint)
+
+## Finally, create the models themselves
+## We'll begin with 10 components
+## This takes a while (10-20 mins on my computer), 
+mfit_PC10_1 <- train(pmltraint$classe ~ ., method="rf", data=trainPC10)
+
+## Let's get predicted values for the verification data and evaluate the model
+verifPC10_1 <- predict(preP10, pmltrainv)
+confusionMatrix(pmltrainv$classe, predict(mfit_PC10_1, verifPC10_1))$overall['Accuracy']
+
+## Which components are most important?
+varImp(mfit_PC10_1)
+```
+
+Let's look at a plot of the 3 most important components, with color used to code error type.
+```{r setup}
+library(knitr)
+library(rgl)
+knit_hooks$set(webgl = hook_webgl)
+```
+
+
+```{r testgl1, webgl=TRUE, echo=TRUE}
+## Let's see a plot of the data by the most imporant three components
+## First, create a color coding for the error classification
+w <- mfit_PC10_1$finalModel[['y']]
+cols <- rainbow(5)[as.numeric(w)]
+
+## Plot the components and add a legend for the error classification
+plot3d(mfit_PC10_1$trainingData[['PC8']],mfit_PC10_1$trainingData[['PC5']],mfit_PC10_1$trainingData[['PC1']], xlab="PC8", ylab="PC5", zlab="PC1", col=cols)
+legend3d("topright", c("A", "B", "C", "D", "E"), pch=16, col=unique(cols))
+```
+
+# FURTHER MODEL DEVELOPMENT, COMPARISON AND SELECTION
+
+Now let's try varying the number of components of the PCA to find an optimal number.
+
+``` {r echo=TRUE}
+
+## Let's try using random forests on an 11 component PCA (takes even longer...!)
+mfit_PC11_1 <- train(pmltraint$classe ~ ., method="rf", data=trainPC11)
+
+## Let's get predicted values for the verification data and evaluate the model
+verifPC11_1 <- predict(preP11, pmltrainv)
+confusionMatrix(pmltrainv$classe, predict(mfit_PC11_1, verifPC11_1))$overall['Accuracy']
+
+
+## Now let's try 12 components (takes some time...)
+mfit_PC12_1 <- train(pmltraint$classe ~ ., method="rf", data=trainPC12)
+
+## Let's get predicted values for the verification data and evaluate the model
+verifPC12_1 <- predict(preP12, pmltrainv)
+confusionMatrix(pmltrainv$classe, predict(mfit_PC12_1, verifPC12_1))$overall['Accuracy']
+
+## Now let's try 13 components (takes some time...)
+mfit_PC13_1 <- train(pmltraint$classe ~ ., method="rf", data=trainPC13)
+
+## Let's get predicted values for the verification data and evaluate the model
+verifPC13_1 <- predict(preP13, pmltrainv)
+confusionMatrix(pmltrainv$classe, predict(mfit_PC13_1, verifPC13_1))$overall['Accuracy']
+
+## Which components are most important?
+varImp(mfit_PC13_1)
+```
+
+We see that the accuracy improves with each component that we add, but let's also consider how reliable these improvements are by plotting the accuracy, kappa and 95% confidence intervals.
+
+``` {r echo=TRUE}
+## Let's compare the Accuracy of these models now
+results <- resamples(list(PC10=mfit_PC10_1, PC11=mfit_PC11_1, PC12=mfit_PC12_1, PC13=mfit_PC13_1))
+dotplot(results)
+```
+
+Up to the 12th component, the 95% confidence intervals of the accuracy estimates do not overlap. However, the CI of the accuracy estimate of the 13 PC models overlaps with that of the 12 PC model. Thus, we will use the model with 12 PCs, since additional components will have negligible impact and may lead to overfitting of the model to the training data set, and concommitantly, to lower accuracy on subsequent new data sets.
+
+Let's plot the three most important components of the optimal 12-component PCA, and review the final model produced during training.
+
+```{r testgl2, webgl=TRUE, echo=TRUE}
+## Let's see a plot of the data by the most imporant three components
+## First, create a color coding for the error classification
+w <- mfit_PC12_1$finalModel[['y']]
+cols <- rainbow(5)[as.numeric(w)]
+
+## Plot the components and add a legend for the error classification
+plot3d(mfit_PC12_1$trainingData[['PC12']],mfit_PC12_1$trainingData[['PC8']],mfit_PC12_1$trainingData[['PC5']], xlab="PC12", ylab="PC8", zlab="PC5", col=cols)
+legend3d("topright", c("A", "B", "C", "D", "E"), pch=16, col=unique(cols))
+
+## Review final model
+mfit_PC12_1$finalModel 
+```
+
+The model's estimated out of sample error rate is 3.46%, with a maximum conditional error rate of 6.3%. These values are low, and by stopping here, we avoid the possibility of overfitting. This is likely close to the optimal point for accurate generalization to new samples. 
+
+# TEST DATA PREDICTION
+
+Let's apply this model to predict the error types of the 20 test cases.
+
+``` {r echo=TRUE}
+## First we need to calculate the principal components for this test data
+testPC12 <- predict(preP12, pmltest)
+
+## Now we can predict the error types of these cases
+FinPred <- predict(mfit_PC12_1, testPC12)
+print(FinPred)
+```
+
+Finally, here is a reminder of the interpretations of these types of unilateral bicep dumbell curl: (A) correctly, (B) throwing elbows forward, (C) lifting only halfway, (D) lowering only halfway, (E) throwing hips forward. 
